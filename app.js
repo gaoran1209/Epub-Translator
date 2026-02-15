@@ -83,7 +83,9 @@ const CHECKPOINT_VERSION = 1;
 const CHECKPOINT_PREFIX = "epub-translator:v1:";
 
 const BATCH_MAX_ITEMS = 40;
-const BATCH_MAX_CHARS = 5000;
+const BATCH_MAX_CHARS = 8000;
+const REQUEST_TIMEOUT_MS = 30000;
+const BATCH_CONCURRENCY = 3;
 
 const runtime = {
   fileStates: [],
@@ -129,7 +131,7 @@ function logEvent(level, message, details) {
   }
 
   if (runtime.logMode) {
-    logOutput.textContent = runtime.logs.join("\n");
+    logOutput.textContent += (logOutput.textContent ? "\n" : "") + line;
     logOutput.scrollTop = logOutput.scrollHeight;
   }
 
@@ -142,6 +144,7 @@ function setLogMode(enabled) {
   logPanel.classList.toggle("hidden", !enabled);
   if (enabled) {
     logOutput.textContent = runtime.logs.join("\n");
+    logOutput.scrollTop = logOutput.scrollHeight;
   }
 }
 
@@ -289,6 +292,7 @@ function collectTextNodes(doc) {
 }
 
 function parseJsonArray(text) {
+  // Attempt 1: direct parse
   try {
     const direct = JSON.parse(text);
     if (Array.isArray(direct)) {
@@ -298,6 +302,7 @@ function parseJsonArray(text) {
     // noop
   }
 
+  // Attempt 2: extract from fenced code block
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
   if (fenced) {
     try {
@@ -310,11 +315,27 @@ function parseJsonArray(text) {
     }
   }
 
+  // Attempt 3: extract bracket-delimited substring
   const start = text.indexOf("[");
   const end = text.lastIndexOf("]");
   if (start >= 0 && end > start) {
+    const slice = text.slice(start, end + 1);
     try {
-      const value = JSON.parse(text.slice(start, end + 1));
+      const value = JSON.parse(slice);
+      if (Array.isArray(value)) {
+        return value;
+      }
+    } catch {
+      // noop
+    }
+
+    // Attempt 4: fix common issues — trailing commas, unescaped newlines
+    try {
+      const cleaned = slice
+        .replace(/,\s*([\]\}])/g, "$1")
+        .replace(/([\[,])\s*,/g, "$1")
+        .replace(/\\n/g, "\\n");
+      const value = JSON.parse(cleaned);
       if (Array.isArray(value)) {
         return value;
       }
@@ -384,25 +405,47 @@ function resetPreview() {
 }
 
 function renderFileList() {
-  fileList.innerHTML = "";
+  const existingItems = new Map();
+  for (const li of fileList.querySelectorAll(".file-item")) {
+    existingItems.set(li.dataset.name, li);
+  }
 
   for (const item of runtime.fileStates) {
-    const li = document.createElement("li");
-    li.className = `file-item ${item.status}${runtime.selectedFile === item.name ? " active" : ""}`;
-    li.dataset.name = item.name;
+    const expectedClass = `file-item ${item.status}${runtime.selectedFile === item.name ? " active" : ""}`;
+    const label = fileStateLabel(item);
+    let li = existingItems.get(item.name);
 
-    const name = document.createElement("span");
-    name.className = "file-name";
-    name.title = item.name;
-    name.textContent = item.name;
+    if (li) {
+      existingItems.delete(item.name);
+      if (li.className !== expectedClass) {
+        li.className = expectedClass;
+      }
+      const stateSpan = li.querySelector(".file-state");
+      if (stateSpan && stateSpan.textContent !== label) {
+        stateSpan.textContent = label;
+      }
+    } else {
+      li = document.createElement("li");
+      li.className = expectedClass;
+      li.dataset.name = item.name;
 
-    const state = document.createElement("span");
-    state.className = "file-state";
-    state.textContent = fileStateLabel(item);
+      const name = document.createElement("span");
+      name.className = "file-name";
+      name.title = item.name;
+      name.textContent = item.name;
 
-    li.appendChild(name);
-    li.appendChild(state);
-    fileList.appendChild(li);
+      const state = document.createElement("span");
+      state.className = "file-state";
+      state.textContent = label;
+
+      li.appendChild(name);
+      li.appendChild(state);
+      fileList.appendChild(li);
+    }
+  }
+
+  for (const stale of existingItems.values()) {
+    stale.remove();
   }
 }
 
@@ -686,6 +729,22 @@ async function saveCheckpoint({ checkpointId, identity, fileNames, translatedMap
   }
 }
 
+function combineSignals(userSignal) {
+  const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+  if (!userSignal) {
+    return timeoutSignal;
+  }
+  if (typeof AbortSignal.any === "function") {
+    return AbortSignal.any([userSignal, timeoutSignal]);
+  }
+  // Fallback for browsers without AbortSignal.any
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  userSignal.addEventListener("abort", onAbort, { once: true });
+  timeoutSignal.addEventListener("abort", onAbort, { once: true });
+  return controller.signal;
+}
+
 async function callGeminiBatch({
   apiKey,
   model,
@@ -697,6 +756,7 @@ async function callGeminiBatch({
 }) {
   const normalizedModel = normalizeModelName(model);
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(normalizedModel)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const combinedSignal = combineSignals(signal);
 
   const userPrompt = [
     `将下面 JSON 数组中的每一项翻译为${targetLanguage}。`,
@@ -716,7 +776,7 @@ async function callGeminiBatch({
         "Content-Type": "application/json"
       },
       body: JSON.stringify(body),
-      signal
+      signal: combinedSignal
     });
 
     if (!response.ok) {
@@ -746,6 +806,9 @@ async function callGeminiBatch({
     });
   } catch (err) {
     const message = String(err?.message || "");
+    if (err.name === "TimeoutError") {
+      throw new Error(`${logPrefix}请求超时 (${REQUEST_TIMEOUT_MS / 1000}s)`);
+    }
     const unsupportedMime =
       message.includes("responseMimeType") || message.includes("response_mime_type");
 
@@ -796,6 +859,7 @@ async function callOpenAICompatibleBatch({
   signal
 }) {
   const endpoint = `${baseUrl}/chat/completions`;
+  const combinedSignal = combineSignals(signal);
 
   const userPrompt = [
     `将下面 JSON 数组中的每一项翻译为${targetLanguage}。`,
@@ -808,22 +872,30 @@ async function callOpenAICompatibleBatch({
     JSON.stringify(texts)
   ].join("\n");
 
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt }
-      ],
-      temperature: 0.1
-    }),
-    signal
-  });
+  let response;
+  try {
+    response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt }
+        ],
+        temperature: 0.1
+      }),
+      signal: combinedSignal
+    });
+  } catch (err) {
+    if (err.name === "TimeoutError") {
+      throw new Error(`${logPrefix}请求超时 (${REQUEST_TIMEOUT_MS / 1000}s)`);
+    }
+    throw err;
+  }
 
   if (!response.ok) {
     const message = await response.text();
@@ -879,6 +951,66 @@ async function callModelBatch({
   });
 }
 
+async function translateSingleBatch({
+  batch,
+  batchIndex,
+  totalBatches,
+  allConfigs,
+  systemPrompt,
+  targetLanguage,
+  logPrefix,
+  signal
+}) {
+  let lastError;
+
+  // Outer loop: try each provider config
+  for (let configIndex = 0; configIndex < allConfigs.length; configIndex += 1) {
+    const currentConfig = allConfigs[configIndex];
+    const configName = currentConfig.name || currentConfig.provider;
+
+    // Inner loop: retry up to 3 times per provider
+    for (let retry = 0; retry < 3; retry += 1) {
+      if (signal?.aborted) {
+        throw new Error("翻译已取消");
+      }
+
+      try {
+        logEvent(
+          "INFO",
+          `${logPrefix}批次 ${batchIndex + 1}/${totalBatches}`,
+          `items=${batch.length}, model=${currentConfig.model}, provider=${configName}, retry=${retry}`
+        );
+
+        return await callModelBatch({
+          providerConfig: currentConfig,
+          systemPrompt,
+          targetLanguage,
+          texts: batch,
+          logPrefix,
+          signal
+        });
+      } catch (error) {
+        if (error.name === "AbortError" || error.message === "翻译已取消") {
+          throw new Error("翻译已取消");
+        }
+        lastError = error;
+        logEvent("WARN", `${logPrefix}${configName} 批次 ${batchIndex + 1} 失败 (retry=${retry})`, String(error?.message || error));
+
+        if (retry < 2) {
+          const backoffMs = Math.min(1000 * Math.pow(2, retry), 8000);
+          await delay(backoffMs);
+        }
+      }
+    }
+
+    if (configIndex < allConfigs.length - 1) {
+      logEvent("INFO", `${logPrefix}切换到备用模型: ${allConfigs[configIndex + 1].name || allConfigs[configIndex + 1].provider}`);
+    }
+  }
+
+  throw lastError;
+}
+
 async function translateTextsInBatches({
   providerConfig,
   fallbackConfigs = [],
@@ -890,74 +1022,52 @@ async function translateTextsInBatches({
   signal
 }) {
   const batches = buildBatches(texts);
-  const translated = [];
   const allConfigs = [providerConfig, ...fallbackConfigs];
+  const results = new Array(batches.length);
+  let completedCount = 0;
 
-  for (let i = 0; i < batches.length; i += 1) {
-    if (signal?.aborted) {
-      throw new Error("翻译已取消");
-    }
+  // Process batches with controlled concurrency
+  const concurrency = Math.min(BATCH_CONCURRENCY, batches.length);
+  let nextIndex = 0;
+  const errors = [];
 
-    const batch = batches[i];
-    let success = false;
-    let lastError;
-
-    for (let retry = 0; retry < 3; retry += 1) {
+  async function worker() {
+    while (nextIndex < batches.length) {
       if (signal?.aborted) {
         throw new Error("翻译已取消");
       }
 
-      for (let configIndex = 0; configIndex < allConfigs.length; configIndex += 1) {
-        const currentConfig = allConfigs[configIndex];
-        const isPrimary = configIndex === 0;
+      const myIndex = nextIndex++;
+      const batch = batches[myIndex];
 
-        try {
-          logEvent(
-            "INFO",
-            `${logPrefix}批次 ${i + 1}/${batches.length}`,
-            `items=${batch.length}, model=${currentConfig.model}, retry=${retry}`
-          );
+      const part = await translateSingleBatch({
+        batch,
+        batchIndex: myIndex,
+        totalBatches: batches.length,
+        allConfigs,
+        systemPrompt,
+        targetLanguage,
+        logPrefix,
+        signal
+      });
 
-          const part = await callModelBatch({
-            providerConfig: currentConfig,
-            systemPrompt,
-            targetLanguage,
-            texts: batch,
-            logPrefix,
-            signal
-          });
+      results[myIndex] = part;
+      completedCount++;
 
-          translated.push(...part);
-          success = true;
-          break;
-        } catch (error) {
-          if (error.name === "AbortError" || error.message === "翻译已取消") {
-            throw new Error("翻译已取消");
-          }
-          lastError = error;
-          const configName = currentConfig.name || currentConfig.provider;
-          logEvent("WARN", `${logPrefix}${configName} 批次失败`, String(error?.message || error));
-
-          if (!isPrimary && configIndex < allConfigs.length - 1) {
-            logEvent("INFO", `${logPrefix}尝试下一个备用模型...`);
-          }
-        }
+      if (onProgress) {
+        onProgress(completedCount / batches.length);
       }
-
-      if (success) {
-        break;
-      }
-
-      const backoffMs = Math.min(1000 * Math.pow(2, retry), 16000);
-      await delay(backoffMs);
     }
+  }
 
-    if (!success) {
-      throw lastError;
-    }
+  const workers = Array.from({ length: concurrency }, () => worker());
+  await Promise.all(workers);
 
-    if (onProgress) {
-      onProgress((i + 1) / batches.length);
+  // Flatten results in order
+  const translated = [];
+  for (const part of results) {
+    if (part) {
+      translated.push(...part);
     }
   }
 
