@@ -1,6 +1,7 @@
 {
   "version": 2,
-  "public": true,
+  "buildCommand": "",
+  "outputDirectory": ".",
   "cleanUrls": true,
   "trailingSlash": false,
   "rewrites": [
