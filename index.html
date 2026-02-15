@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EPUB 电子书翻译器</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js" defer></script>
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <main class="container">
+      <h1>EPUB 电子书翻译器</h1>
+      <p class="subtitle">上传 EPUB，调用 Gemini 翻译，保留原排版并导出新 EPUB。</p>
+
+      <form id="translator-form" class="card form-card">
+        <section class="field-grid">
+          <label class="field file-upload-field">
+            <span>EPUB 文件</span>
+            <div id="drop-zone" class="drop-zone">
+              <input id="epub-file" type="file" accept=".epub,application/epub+zip" required />
+              <div class="drop-zone-hint">拖拽 EPUB 文件到此处，或点击选择文件</div>
+            </div>
+          </label>
+
+          <label class="field">
+            <span>目标语言</span>
+            <input id="target-language" type="text" placeholder="例如：简体中文 / English / 日本語" required />
+          </label>
+
+          <label class="field">
+            <span>模型提供商</span>
+            <select id="model-provider">
+              <option value="gemini">Google Gemini</option>
+              <option value="zhipu">智谱 GLM</option>
+              <option value="minimax">MiniMax</option>
+              <option value="kimi">Moonshot Kimi</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>API Key</span>
+            <input id="api-key" type="password" placeholder="输入 API Key" required />
+          </label>
+
+          <label class="field">
+            <span>模型名称</span>
+            <input id="model-name" type="text" value="gemini-2.5-flash-lite" />
+          </label>
+
+          <label class="field checkbox-field">
+            <input id="enable-fallback" type="checkbox" checked />
+            <span>启用自动降级（Gemini 不可用时自动切换备用模型）</span>
+          </label>
+        </section>
+
+        <section class="fallback-settings" id="fallback-settings">
+          <h3>备用模型配置</h3>
+          <div class="fallback-grid">
+            <label class="field">
+              <span>智谱 API Key（可选）</span>
+              <input id="zhipu-api-key" type="password" placeholder="智谱 API Key" />
+            </label>
+            <label class="field">
+              <span>智谱模型</span>
+              <input id="zhipu-model" type="text" value="glm-4-flash" />
+            </label>
+            <label class="field">
+              <span>MiniMax API Key（可选）</span>
+              <input id="minimax-api-key" type="password" placeholder="MiniMax API Key" />
+            </label>
+            <label class="field">
+              <span>MiniMax 模型</span>
+              <input id="minimax-model" type="text" value="MiniMax-Text-01" />
+            </label>
+            <label class="field">
+              <span>Kimi API Key（可选）</span>
+              <input id="kimi-api-key" type="password" placeholder="Kimi API Key" />
+            </label>
+            <label class="field">
+              <span>Kimi 模型</span>
+              <input id="kimi-model" type="text" value="moonshot-v1-8k" />
+            </label>
+          </div>
+        </section>
+
+        <section class="prompt-settings">
+          <div class="prompt-head">
+            <h2>模型 Prompt 设置</h2>
+            <button id="reset-prompt-btn" type="button" class="ghost-btn">恢复默认</button>
+          </div>
+          <label class="field">
+            <span>系统提示词模板（支持占位符 <code>{targetLanguage}</code>）</span>
+            <textarea id="system-prompt" rows="8"></textarea>
+          </label>
+        </section>
+
+        <section class="run-settings">
+          <label class="checkbox-field">
+            <input id="log-mode" type="checkbox" />
+            <span>启用 Log 模式（输出调试日志）</span>
+          </label>
+          <p id="checkpoint-hint" class="hint">尚未检测到断点。</p>
+        </section>
+
+        <div class="actions">
+          <button id="translate-btn" type="submit">开始翻译</button>
+          <button id="cancel-btn" type="button" class="ghost-btn" disabled>取消翻译</button>
+          <button id="clear-checkpoint-btn" type="button" class="ghost-btn">清除断点</button>
+        </div>
+      </form>
+
+      <section class="card status-card" aria-live="polite">
+        <div class="status-head">
+          <h2>任务状态</h2>
+          <p id="progress-text">Translation Overall Progress - 0%</p>
+        </div>
+        <p id="status-text">等待上传文件</p>
+        <div class="progress-wrap">
+          <div id="progress-bar" class="progress-bar"></div>
+        </div>
+      </section>
+
+      <section class="card preview-card">
+        <div class="split-layout">
+          <aside class="file-sidebar">
+            <div class="sidebar-title">章节进度</div>
+            <ul id="file-list" class="file-list"></ul>
+          </aside>
+
+          <section class="preview-pane">
+            <div class="preview-title" id="preview-file-title">尚未开始</div>
+            <div class="preview-columns">
+              <article class="preview-column">
+                <h3>原文预览</h3>
+                <div id="original-preview" class="preview-content">暂无预览</div>
+              </article>
+              <article class="preview-column">
+                <h3>译文预览</h3>
+                <div id="translated-preview" class="preview-content">暂无预览</div>
+              </article>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section id="log-panel" class="card hidden">
+        <div class="log-head">
+          <h2>调试日志</h2>
+          <button id="clear-log-btn" type="button" class="ghost-btn">清空日志</button>
+        </div>
+        <pre id="log-output" class="log-output"></pre>
+      </section>
+
+      <section id="result" class="card hidden">
+        <h2>翻译完成</h2>
+        <a id="download-link" download>下载翻译后的 EPUB</a>
+      </section>
+
+      <section class="card tips">
+        <h2>说明</h2>
+        <ul>
+          <li>默认模型为 <code>gemini-2.5-flash-lite</code>，支持手动改为其他 Gemini 模型。</li>
+          <li>断点续翻按“书籍+目标语言+模型+Prompt 模板”维度保存。</li>
+          <li>预览仅用于进度核对，不参与最终 EPUB 结构输出。</li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
