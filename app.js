@@ -86,6 +86,7 @@ const BATCH_MAX_ITEMS = 40;
 const BATCH_MAX_CHARS = 8000;
 const REQUEST_TIMEOUT_MS = 30000;
 const BATCH_CONCURRENCY = 3;
+const CHAPTER_CONCURRENCY = 3;
 
 const runtime = {
   fileStates: [],
@@ -1272,71 +1273,89 @@ async function runTranslation(signal) {
   }
 
   const failedFiles = [];
+  const pendingFiles = filesToTranslate.filter((name) => !translatedMap.has(name));
 
-  for (const fileName of filesToTranslate) {
-    if (signal?.aborted) {
-      throw new Error("翻译已取消");
-    }
+  if (pendingFiles.length === 0) {
+    logEvent("INFO", "所有章节已完成（从断点恢复）");
+  } else {
+    const chapterConcurrency = Math.min(CHAPTER_CONCURRENCY, pendingFiles.length);
+    let nextFileIndex = 0;
 
-    if (translatedMap.has(fileName)) {
-      continue;
-    }
+    logEvent("INFO", `开始翻译 ${pendingFiles.length} 个章节`, `并发数=${chapterConcurrency}`);
 
-    runtime.selectedFile = fileName;
-    renderFileList();
-    await renderSelectedPreview();
+    async function chapterWorker() {
+      while (nextFileIndex < pendingFiles.length) {
+        if (signal?.aborted) {
+          throw new Error("翻译已取消");
+        }
 
-    updateFileState(fileName, { status: "running", progress: 0, error: "" });
-    setStatus(`正在翻译：${fileName}`);
+        const myIndex = nextFileIndex++;
+        const fileName = pendingFiles[myIndex];
 
-    try {
-      const sourceContent = await getSourceContent(fileName);
-      const translated = await translateDocumentContent({
-        content: sourceContent,
-        fileName,
-        providerConfig,
-        fallbackConfigs,
-        systemPrompt,
-        targetLanguage: identity.targetLanguage,
-        onProgress: (progress) => {
-          updateFileState(fileName, { status: "running", progress });
+        // Update UI for this chapter
+        if (!runtime.selectedFile || runtime.selectedFile === pendingFiles[myIndex - 1]) {
+          runtime.selectedFile = fileName;
+        }
+        updateFileState(fileName, { status: "running", progress: 0, error: "" });
+        renderFileList();
+        setStatus(`正在翻译 (${chapterConcurrency} 并发)：${fileName}`);
+
+        try {
+          const sourceContent = await getSourceContent(fileName);
+          const translated = await translateDocumentContent({
+            content: sourceContent,
+            fileName,
+            providerConfig,
+            fallbackConfigs,
+            systemPrompt,
+            targetLanguage: identity.targetLanguage,
+            onProgress: (progress) => {
+              updateFileState(fileName, { status: "running", progress });
+              if (runtime.selectedFile === fileName) {
+                translatedPreview.innerHTML = `<p>翻译中... ${Math.round(progress * 100)}%</p>`;
+              }
+            },
+            signal
+          });
+
+          translatedMap.set(fileName, translated);
+          runtime.currentContext.translatedMap = translatedMap;
+          updateFileState(fileName, { status: "done", progress: 1 });
+
           if (runtime.selectedFile === fileName) {
-            translatedPreview.innerHTML = `<p>翻译中... ${Math.round(progress * 100)}%</p>`;
+            renderSelectedPreview();
           }
-        },
-        signal
-      });
 
-      translatedMap.set(fileName, translated);
-      runtime.currentContext.translatedMap = translatedMap;
-      updateFileState(fileName, { status: "done", progress: 1 });
-      await renderSelectedPreview();
+          await saveCheckpoint({
+            checkpointId: identity.checkpointId,
+            identity,
+            fileNames: filesToTranslate,
+            translatedMap
+          });
+        } catch (error) {
+          if (error.message === "翻译已取消") {
+            updateFileState(fileName, { status: "waiting", progress: 0, error: "" });
+            throw error;
+          }
+          const errorMsg = String(error?.message || error);
+          updateFileState(fileName, { status: "error", error: errorMsg });
+          failedFiles.push({ fileName, error: errorMsg });
 
-      await saveCheckpoint({
-        checkpointId: identity.checkpointId,
-        identity,
-        fileNames: filesToTranslate,
-        translatedMap
-      });
-    } catch (error) {
-      if (error.message === "翻译已取消") {
-        updateFileState(fileName, { status: "waiting", progress: 0, error: "" });
-        throw error;
+          logEvent("ERROR", `章节翻译失败，跳过继续`, `${fileName}: ${errorMsg}`);
+
+          await saveCheckpoint({
+            checkpointId: identity.checkpointId,
+            identity,
+            fileNames: filesToTranslate,
+            translatedMap,
+            lastError: `file=${fileName}; error=${errorMsg}`
+          });
+        }
       }
-      const errorMsg = String(error?.message || error);
-      updateFileState(fileName, { status: "error", error: errorMsg });
-      failedFiles.push({ fileName, error: errorMsg });
-
-      logEvent("ERROR", `章节翻译失败，跳过继续`, `${fileName}: ${errorMsg}`);
-
-      await saveCheckpoint({
-        checkpointId: identity.checkpointId,
-        identity,
-        fileNames: filesToTranslate,
-        translatedMap,
-        lastError: `file=${fileName}; error=${errorMsg}`
-      });
     }
+
+    const workers = Array.from({ length: chapterConcurrency }, () => chapterWorker());
+    await Promise.all(workers);
   }
 
   if (failedFiles.length > 0) {

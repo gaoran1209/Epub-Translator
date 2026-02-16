@@ -1,6 +1,6 @@
 # EPUB 电子书翻译器
 
-一个纯前端 EPUB 翻译工具，支持多种 AI 模型、断点续翻、自动降级和翻译预览。
+一个纯前端 EPUB 翻译工具，支持多种 AI 模型、多章节并发翻译、断点续翻、自动降级和翻译预览。
 
 ## 核心功能
 
@@ -9,6 +9,12 @@
 - **智谱 GLM** - OpenAI 兼容 API，推荐 `glm-4-flash`
 - **MiniMax** - OpenAI 兼容 API，推荐 `MiniMax-Text-01`
 - **Moonshot Kimi** - OpenAI 兼容 API，推荐 `moonshot-v1-8k`
+
+### 高速并发翻译
+- **多章节并发** - 同时翻译多个章节（默认 3 路并发）
+- **多批次并发** - 每个章节内部再分批并行请求（默认 3 路并发）
+- **请求超时保护** - 单次 API 请求 30 秒超时，自动重试
+- **智能批次分组** - 根据文本长度自动分批，最大化 API 吞吐量
 
 ### 自动降级
 主模型不可用时自动切换备用模型，确保翻译任务完成。可在设置中配置多个备用模型的 API Key。
@@ -33,8 +39,14 @@
 ### 本地运行
 
 ```bash
-cd "/Users/ryan/项目/Codex/Epub Translator"
+# 克隆仓库
+git clone https://github.com/gaoran1209/Epub-Translator.git
+cd Epub-Translator
+
+# 启动本地服务器（任选一种）
 python3 -m http.server 8080
+# 或
+npx serve .
 ```
 
 打开 [http://localhost:8080](http://localhost:8080)
@@ -86,6 +98,11 @@ vercel
 - 使用 JSZip 解析和生成 EPUB 文件
 - IndexedDB 存储断点数据
 
+### 并发策略
+- **章节级并发** - 最多 3 个章节同时翻译（`CHAPTER_CONCURRENCY`）
+- **批次级并发** - 每个章节内最多 3 个批次同时请求（`BATCH_CONCURRENCY`）
+- **峰值请求数** - 最多 3 × 3 = 9 个 API 请求并行
+
 ### 安全
 - API Key 仅在浏览器本地使用，不上传任何服务器
 - 所有翻译请求直接发送到对应 AI 平台
@@ -97,7 +114,7 @@ vercel
 ## 项目结构
 
 ```
-Epub Translator/
+Epub-Translator/
 ├── index.html      # 主页面
 ├── app.js          # 核心逻辑
 ├── styles.css      # 样式文件
