@@ -83,7 +83,9 @@ const CHECKPOINT_VERSION = 1;
 const CHECKPOINT_PREFIX = "epub-translator:v1:";
 
 const BATCH_MAX_ITEMS = 40;
-const BATCH_MAX_CHARS = 8000;
+const BATCH_HARD_MAX_CHARS = 12000;
+const BATCH_TARGET_TOKENS_DEFAULT = 2800;
+const BATCH_TARGET_TOKENS_MIN = 1200;
 const REQUEST_TIMEOUT_MS = 30000;
 const BATCH_CONCURRENCY = 3;
 const CHAPTER_CONCURRENCY = 3;
@@ -173,37 +175,38 @@ function getCurrentProviderConfig() {
   };
 }
 
-function getFallbackConfigs() {
-  const configs = [];
-
-  if (zhipuApiKeyInput.value.trim()) {
-    configs.push({
-      provider: "zhipu",
-      ...MODEL_PROVIDERS.zhipu,
+function getFallbackConfigs(primaryProvider) {
+  const providerInputs = {
+    zhipu: {
       apiKey: zhipuApiKeyInput.value.trim(),
       model: zhipuModelInput.value.trim() || MODEL_PROVIDERS.zhipu.defaultModel
-    });
-  }
-
-  if (minimaxApiKeyInput.value.trim()) {
-    configs.push({
-      provider: "minimax",
-      ...MODEL_PROVIDERS.minimax,
+    },
+    minimax: {
       apiKey: minimaxApiKeyInput.value.trim(),
       model: minimaxModelInput.value.trim() || MODEL_PROVIDERS.minimax.defaultModel
-    });
-  }
-
-  if (kimiApiKeyInput.value.trim()) {
-    configs.push({
-      provider: "kimi",
-      ...MODEL_PROVIDERS.kimi,
+    },
+    kimi: {
       apiKey: kimiApiKeyInput.value.trim(),
       model: kimiModelInput.value.trim() || MODEL_PROVIDERS.kimi.defaultModel
-    });
-  }
+    }
+  };
 
-  return configs;
+  return FALLBACK_ORDER
+    .filter((provider) => provider !== primaryProvider)
+    .map((provider) => {
+      const input = providerInputs[provider];
+      if (!input?.apiKey) {
+        return null;
+      }
+
+      return {
+        provider,
+        ...MODEL_PROVIDERS[provider],
+        apiKey: input.apiKey,
+        model: input.model
+      };
+    })
+    .filter(Boolean);
 }
 
 function renderSystemPrompt(template, targetLanguage) {
@@ -223,24 +226,117 @@ function splitOuterWhitespace(text) {
   return { leading, core, trailing };
 }
 
-function buildBatches(items, maxItems = BATCH_MAX_ITEMS, maxChars = BATCH_MAX_CHARS) {
+function estimateTextTokens(text) {
+  const value = String(text || "");
+  if (!value) {
+    return 0;
+  }
+
+  const cjkMatches = value.match(/[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff]/g) || [];
+  const cjkCount = cjkMatches.length;
+  const otherCount = Math.max(0, value.length - cjkCount);
+  return Math.ceil(cjkCount + otherCount / 4);
+}
+
+function inferContextTokensFromModelName(modelName) {
+  const normalized = normalizeModelName(modelName).toLowerCase();
+  const match = normalized.match(/(?:^|[^0-9])(\d{1,4})k(?:[^0-9]|$)/i);
+  if (match) {
+    return Number(match[1]) * 1000;
+  }
+
+  if (normalized.includes("flash-lite")) {
+    return 64000;
+  }
+
+  if (normalized.includes("flash")) {
+    return 32000;
+  }
+
+  if (normalized.includes("mini")) {
+    return 16000;
+  }
+
+  return 32000;
+}
+
+function getBatchLimitsForConfig(config) {
+  const contextTokens = inferContextTokensFromModelName(config?.model || "");
+  let targetTokens = BATCH_TARGET_TOKENS_DEFAULT;
+
+  if (contextTokens <= 8000) {
+    targetTokens = 1400;
+  } else if (contextTokens <= 16000) {
+    targetTokens = 2000;
+  } else if (contextTokens <= 32000) {
+    targetTokens = 2800;
+  } else if (contextTokens <= 64000) {
+    targetTokens = 3600;
+  } else {
+    targetTokens = 4600;
+  }
+
+  targetTokens = Math.max(BATCH_TARGET_TOKENS_MIN, targetTokens);
+  const maxChars = Math.max(5000, Math.min(BATCH_HARD_MAX_CHARS, targetTokens * 4));
+
+  return {
+    maxItems: BATCH_MAX_ITEMS,
+    maxChars,
+    targetTokens
+  };
+}
+
+function resolveBatchLimits(configs) {
+  const validConfigs = Array.isArray(configs) ? configs.filter(Boolean) : [];
+  if (validConfigs.length === 0) {
+    return {
+      maxItems: BATCH_MAX_ITEMS,
+      maxChars: BATCH_HARD_MAX_CHARS,
+      targetTokens: BATCH_TARGET_TOKENS_DEFAULT
+    };
+  }
+
+  const limits = validConfigs.map((config) => getBatchLimitsForConfig(config));
+  return limits.reduce(
+    (acc, item) => ({
+      maxItems: Math.min(acc.maxItems, item.maxItems),
+      maxChars: Math.min(acc.maxChars, item.maxChars),
+      targetTokens: Math.min(acc.targetTokens, item.targetTokens)
+    }),
+    limits[0]
+  );
+}
+
+function buildBatches(
+  items,
+  {
+    maxItems = BATCH_MAX_ITEMS,
+    maxChars = BATCH_HARD_MAX_CHARS,
+    targetTokens = BATCH_TARGET_TOKENS_DEFAULT
+  } = {}
+) {
   const batches = [];
   let current = [];
   let currentChars = 0;
+  let currentTokens = 0;
 
   for (const item of items) {
     const len = item.length;
+    const tokenLen = estimateTextTokens(item);
     const shouldSplit =
-      current.length > 0 && (current.length >= maxItems || currentChars + len > maxChars);
+      current.length > 0 &&
+      (current.length >= maxItems || currentChars + len > maxChars || currentTokens + tokenLen > targetTokens);
 
     if (shouldSplit) {
       batches.push(current);
       current = [];
       currentChars = 0;
+      currentTokens = 0;
     }
 
     current.push(item);
     currentChars += len;
+    currentTokens += tokenLen;
   }
 
   if (current.length > 0) {
@@ -348,7 +444,162 @@ function parseJsonArray(text) {
   throw new Error("模型返回无法解析为 JSON 数组");
 }
 
-function getCandidateFiles(zip) {
+function normalizeZipPath(path) {
+  const chunks = String(path || "")
+    .replace(/\\/g, "/")
+    .split("/");
+  const stack = [];
+
+  for (const chunk of chunks) {
+    if (!chunk || chunk === ".") {
+      continue;
+    }
+    if (chunk === "..") {
+      if (stack.length > 0) {
+        stack.pop();
+      }
+      continue;
+    }
+    stack.push(chunk);
+  }
+
+  return stack.join("/");
+}
+
+function getZipDirectory(path) {
+  const normalized = normalizeZipPath(path);
+  const index = normalized.lastIndexOf("/");
+  return index >= 0 ? normalized.slice(0, index + 1) : "";
+}
+
+function resolveZipPath(baseDir, relativePath) {
+  const cleanRelative = String(relativePath || "").split("#")[0].split("?")[0];
+  return normalizeZipPath(`${baseDir}${cleanRelative}`);
+}
+
+function getXmlElementsByTag(doc, tagName) {
+  const direct = Array.from(doc.getElementsByTagName(tagName));
+  if (direct.length > 0) {
+    return direct;
+  }
+  return Array.from(doc.getElementsByTagNameNS("*", tagName));
+}
+
+function isHtmlContentResource(href, mediaType) {
+  const lowerHref = String(href || "").toLowerCase();
+  const lowerType = String(mediaType || "").toLowerCase();
+  if (/\.(xhtml|html|htm)$/i.test(lowerHref)) {
+    return true;
+  }
+  return lowerType.includes("xhtml") || lowerType.includes("html");
+}
+
+function createZipNameIndex(zip) {
+  const index = new Map();
+  for (const name of Object.keys(zip.files)) {
+    const normalized = normalizeZipPath(name).toLowerCase();
+    if (!index.has(normalized)) {
+      index.set(normalized, name);
+    }
+  }
+  return index;
+}
+
+function findZipEntryName(zipNameIndex, path) {
+  const normalized = normalizeZipPath(path);
+  if (!normalized) {
+    return "";
+  }
+
+  const direct = zipNameIndex.get(normalized.toLowerCase());
+  if (direct) {
+    return direct;
+  }
+
+  try {
+    const decoded = normalizeZipPath(decodeURIComponent(normalized));
+    return zipNameIndex.get(decoded.toLowerCase()) || "";
+  } catch {
+    return "";
+  }
+}
+
+async function getSpineHtmlFiles(zip) {
+  const zipNameIndex = createZipNameIndex(zip);
+  const containerName = findZipEntryName(zipNameIndex, "META-INF/container.xml");
+  if (!containerName) {
+    return [];
+  }
+
+  const containerContent = await zip.file(containerName).async("string");
+  const parser = new DOMParser();
+  const containerDoc = parser.parseFromString(containerContent, "application/xml");
+  const rootfiles = getXmlElementsByTag(containerDoc, "rootfile");
+  const packagePathRaw = rootfiles[0]?.getAttribute("full-path")?.trim();
+  if (!packagePathRaw) {
+    return [];
+  }
+
+  const packagePath = normalizeZipPath(packagePathRaw);
+  const packageName = findZipEntryName(zipNameIndex, packagePath);
+  if (!packageName) {
+    return [];
+  }
+
+  const packageContent = await zip.file(packageName).async("string");
+  const packageDoc = parser.parseFromString(packageContent, "application/xml");
+
+  const manifestById = new Map();
+  for (const item of getXmlElementsByTag(packageDoc, "item")) {
+    const id = item.getAttribute("id");
+    const href = item.getAttribute("href");
+    if (!id || !href) {
+      continue;
+    }
+
+    manifestById.set(id, {
+      href,
+      mediaType: item.getAttribute("media-type") || ""
+    });
+  }
+
+  const opfDir = getZipDirectory(packagePath);
+  const seen = new Set();
+  const files = [];
+  for (const itemref of getXmlElementsByTag(packageDoc, "itemref")) {
+    const idref = itemref.getAttribute("idref");
+    if (!idref || !manifestById.has(idref)) {
+      continue;
+    }
+
+    const item = manifestById.get(idref);
+    if (!isHtmlContentResource(item.href, item.mediaType)) {
+      continue;
+    }
+
+    const resolved = resolveZipPath(opfDir, item.href);
+    const entryName = findZipEntryName(zipNameIndex, resolved);
+    if (!entryName || seen.has(entryName)) {
+      continue;
+    }
+
+    seen.add(entryName);
+    files.push(entryName);
+  }
+
+  return files;
+}
+
+async function getCandidateFiles(zip) {
+  try {
+    const spineFiles = await getSpineHtmlFiles(zip);
+    if (spineFiles.length > 0) {
+      return spineFiles;
+    }
+  } catch (error) {
+    logEvent("WARN", "解析 OPF spine 失败，回退到扩展名扫描", String(error?.message || error));
+  }
+
   return Object.keys(zip.files)
     .filter((name) => {
       const file = zip.files[name];
@@ -361,7 +612,7 @@ function getCandidateFiles(zip) {
         return false;
       }
 
-      return /\.(xhtml|html|htm|ncx)$/i.test(lower);
+      return /\.(xhtml|html|htm)$/i.test(lower);
     })
     .sort();
 }
@@ -952,6 +1203,27 @@ async function callModelBatch({
   });
 }
 
+function dedupeProviderConfigs(configs) {
+  const seenProviders = new Set();
+  const deduped = [];
+
+  for (const config of configs || []) {
+    if (!config || !config.apiKey) {
+      continue;
+    }
+
+    const provider = String(config.provider || "").toLowerCase();
+    if (!provider || seenProviders.has(provider)) {
+      continue;
+    }
+
+    seenProviders.add(provider);
+    deduped.push(config);
+  }
+
+  return deduped;
+}
+
 async function translateSingleBatch({
   batch,
   batchIndex,
@@ -1022,15 +1294,24 @@ async function translateTextsInBatches({
   logPrefix,
   signal
 }) {
-  const batches = buildBatches(texts);
-  const allConfigs = [providerConfig, ...fallbackConfigs];
+  const allConfigs = dedupeProviderConfigs([providerConfig, ...fallbackConfigs]);
+  if (allConfigs.length === 0) {
+    throw new Error("未配置可用模型");
+  }
+
+  const batchLimits = resolveBatchLimits(allConfigs);
+  const batches = buildBatches(texts, batchLimits);
+  logEvent(
+    "INFO",
+    `${logPrefix}批次切分完成`,
+    `batches=${batches.length}, maxItems=${batchLimits.maxItems}, maxChars=${batchLimits.maxChars}, targetTokens=${batchLimits.targetTokens}`
+  );
   const results = new Array(batches.length);
   let completedCount = 0;
 
   // Process batches with controlled concurrency
   const concurrency = Math.min(BATCH_CONCURRENCY, batches.length);
   let nextIndex = 0;
-  const errors = [];
 
   async function worker() {
     while (nextIndex < batches.length) {
@@ -1232,7 +1513,7 @@ async function runTranslation(signal) {
   const identity = await resolveCheckpointIdentity();
   const providerConfig = getCurrentProviderConfig();
   const enableFallback = enableFallbackInput.checked;
-  const fallbackConfigs = enableFallback ? getFallbackConfigs() : [];
+  const fallbackConfigs = enableFallback ? getFallbackConfigs(providerConfig.provider) : [];
 
   if (!identity) {
     throw new Error("请先选择 EPUB 并填写目标语言和 Prompt 模板");
@@ -1244,7 +1525,7 @@ async function runTranslation(signal) {
 
   const systemPrompt = renderSystemPrompt(identity.promptTemplate, identity.targetLanguage);
   const zip = await JSZip.loadAsync(identity.arrayBuffer);
-  const filesToTranslate = getCandidateFiles(zip);
+  const filesToTranslate = await getCandidateFiles(zip);
   let checkpoint = null;
   try {
     checkpoint = await dbGetCheckpoint(identity.checkpointId);
